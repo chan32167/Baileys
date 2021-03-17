@@ -96,8 +96,6 @@ console.log ("oh hello " + conn.user.name + "! You connected via a proxy")
 The entire `WAConnectOptions` struct is mentioned here with default values:
 ``` ts
 conn.connectOptions = {
-    /** New QR generation interval, set to null if you don't want to regenerate */
-    regenerateQRIntervalMs?: 30_000,
     /** fails the connection if no data is received for X seconds */
     maxIdleTimeMs?: 15_000,
     /** maximum attempts to connect */
@@ -183,51 +181,52 @@ Also, these events are fired regardless of whether they are initiated by the Bai
 on (event: 'open', listener: (result: WAOpenResult) => void): this
 /** when the connection is opening */
 on (event: 'connecting', listener: () => void): this
-/** when the connection has been validated */
-on (event: 'connection-validated', listener: (user: WAUser) => void): this
 /** when the connection has closed */
 on (event: 'close', listener: (err: {reason?: DisconnectReason | string, isReconnecting: boolean}) => void): this
 /** when the socket is closed */
 on (event: 'ws-close', listener: (err: {reason?: DisconnectReason | string}) => void): this
-/** when WA updates the credentials */
-on (event: 'credentials-updated', listener: (auth: AuthenticationCredentials) => void): this
 /** when a new QR is generated, ready for scanning */
 on (event: 'qr', listener: (qr: string) => void): this
 /** when the connection to the phone changes */
 on (event: 'connection-phone-change', listener: (state: {connected: boolean}) => void): this
-/** when a user's status is updated */
-on (event: 'user-status-update', listener: (update: {jid: string, status?: string}) => void): this
+/** when a contact is updated */
+on (event: 'contact-update', listener: (update: WAContactUpdate) => void): this
 /** when a new chat is added */
 on (event: 'chat-new', listener: (chat: WAChat) => void): this
 /** when contacts are sent by WA */
-on (event: 'contacts-received', listener: () => void): this
-/** when chats are sent by WA, and when all messages are received from WhatsApp */
-on (event: 'chats-received', listener: (update: {hasNewChats?: boolean, hasReceivedLastMessage?: boolean}) => void): this
+on (event: 'contacts-received', listener: (u: { updatedContacts: Partial<WAContact>[] }) => void): this
+/** when chats are sent by WA, and when all messages are received */
+on (event: 'chats-received', listener: (update: {hasNewChats?: boolean}) => void): this
+/** when all initial messages are received from WA */
+on (event: 'initial-data-received', listener: (update: {chatsWithMissingMessages: { jid: string, count: number }[] }) => void): this
 /** when multiple chats are updated (new message, updated message, deleted, pinned, etc) */
 on (event: 'chats-update', listener: (chats: WAChatUpdate[]) => void): this
-/** when a chat is updated (new message, updated message, deleted, pinned, presence updated etc) */
-on (event: 'chat-update', listener: (chat: Partial<WAChat> & { hasNewMessage: boolean }) => void): this
-/** when a message's status is updated (deleted, delivered, read, sent etc.) */
-on (event: 'message-status-update', listener: (message: WAMessageStatusUpdate) => void): this
+/** when a chat is updated (new message, updated message, read message, deleted, pinned, presence updated etc) */
+on (event: 'chat-update', listener: (chat: WAChatUpdate) => void): this
 /** when participants are added to a group */
 on (event: 'group-participants-update', listener: (update: {jid: string, participants: string[], actor?: string, action: WAParticipantAction}) => void): this
 /** when the group is updated */
 on (event: 'group-update', listener: (update: Partial<WAGroupMetadata> & {jid: string, actor?: string}) => void): this
 /** when WA sends back a pong */
 on (event: 'received-pong', listener: () => void): this
+/** when a user is blocked or unblockd */
+on (event: 'blocklist-update', listener: (update: BlocklistUpdate) => void): this
 ```
 
 ## Sending Messages
 
-Send like, all types of messages with a single function:
+**Send all types of messages with a single function:**
+
+### Non-Media Messages
+
 ``` ts
 import { MessageType, MessageOptions, Mimetype } from '@adiwajshing/baileys'
 
 const id = 'abcd@s.whatsapp.net' // the WhatsApp ID 
 // send a simple text!
-conn.sendMessage (id, 'oh hello there', MessageType.text)
+const sentMsg  = await conn.sendMessage (id, 'oh hello there', MessageType.text)
 // send a location!
-conn.sendMessage(id, {degreesLatitude: 24.121231, degreesLongitude: 55.1121221}, MessageType.location)
+const sentMsg  = await conn.sendMessage(id, {degreesLatitude: 24.121231, degreesLongitude: 55.1121221}, MessageType.location)
 // send a contact!
 const vcard = 'BEGIN:VCARD\n' // metadata of the contact card
             + 'VERSION:3.0\n' 
@@ -235,27 +234,60 @@ const vcard = 'BEGIN:VCARD\n' // metadata of the contact card
             + 'ORG:Ashoka Uni;\n' // the organization of the contact
             + 'TEL;type=CELL;type=VOICE;waid=911234567890:+91 12345 67890\n' // WhatsApp ID + phone number
             + 'END:VCARD'
-conn.sendMessage(id, {displayname: "Jeff", vcard: vcard}, MessageType.contact)
-// send a gif
-const buffer = fs.readFileSync("Media/ma_gif.mp4") // load some gif
-const options: MessageOptions = {mimetype: Mimetype.gif, caption: "hello!"} // some metadata & caption
-conn.sendMessage(id, buffer, MessageType.video, options)
-// send an audio file
-const buffer = fs.readFileSync("Media/audio.mp3") // can send mp3, mp4, & ogg
-const options: MessageOptions = {mimetype: Mimetype.mp4Audio} // some metadata (can't have caption in audio)
-conn.sendMessage(id, buffer, MessageType.audio, options)
+const sentMsg  = await conn.sendMessage(id, {displayname: "Jeff", vcard: vcard}, MessageType.contact)
 ```
 
-To note:
+### Media Messages
+
+Sending media (video, stickers, images) is easier & more efficient than ever. 
+- You can specify a buffer, a local url or even a remote url.
+- When specifying a media url, Baileys never loads the entire buffer into memory, it even encrypts the media as a readable stream.
+
+``` ts
+import { MessageType, MessageOptions, Mimetype } from '@adiwajshing/baileys'
+// Sending gifs
+await conn.sendMessage(
+    id, 
+    fs.readFileSync("Media/ma_gif.mp4"), // load a gif and send it
+    MessageType.video, 
+    { mimetype: Mimetype.gif, caption: "hello!" }
+)
+await conn.sendMessage(
+    id, 
+    { url: 'Media/ma_gif.mp4' }, // send directly from local file
+    MessageType.video, 
+    { mimetype: Mimetype.gif, caption: "hello!" }
+)
+
+await conn.sendMessage(
+    id, 
+    { url: 'https://giphy.com/gifs/11JTxkrmq4bGE0/html5' }, // send directly from remote url!
+    MessageType.video, 
+    { mimetype: Mimetype.gif, caption: "hello!" }
+)
+
+// send an audio file
+await conn.sendMessage(
+    id, 
+    { url: "Media/audio.mp3" }, // can send mp3, mp4, & ogg
+    MessageType.audio, 
+    { mimetype: Mimetype.mp4Audio } // some metadata (can't have caption in audio)
+)
+```
+
+
+### Notes
+
 - `id` is the WhatsApp ID of the person or group you're sending the message to. 
     - It must be in the format ```[country code][phone number]@s.whatsapp.net```, for example ```+19999999999@s.whatsapp.net``` for people. For groups, it must be in the format ``` 123456789-123345@g.us ```. 
+    - For broadcast lists it's `[timestamp of creation]@broadcast`.
+    - For stories, the ID is `status@broadcast`.
 - For media messages, the thumbnail can be generated automatically for images & stickers. Thumbnails for videos can also be generated automatically, though, you need to have `ffmpeg` installed on your system.
 - **MessageOptions**: some extra info about the message. It can have the following __optional__ values:
     ``` ts
     const info: MessageOptions = {
         quoted: quotedMessage, // the message you want to quote
-        contextInfo: { forwardingScore: 2, isForwarded: true }, // some random context info 
-        // (can show a forwarded message with this too)
+        contextInfo: { forwardingScore: 2, isForwarded: true }, // some random context info (can show a forwarded message with this too)
         timestamp: Date(), // optional, if you want to manually set the timestamp of the message
         caption: "hello there!", // (for media messages) the caption to send with the media (cannot be sent with stickers though)
         thumbnail: "23GD#4/==", /*  (for location & media messages) has to be a base 64 encoded JPEG if you want to send a custom thumb, 
@@ -263,13 +295,16 @@ To note:
                                     Do not enter this field if you want to automatically generate a thumb
                                 */
         mimetype: Mimetype.pdf, /* (for media messages) specify the type of media (optional for all media types except documents),
-                                        import {Mimetype} from '@adiwajshing/baileys'
+                                    import {Mimetype} from '@adiwajshing/baileys'
                                 */
         filename: 'somefile.pdf', // (for media messages) file name for the media
         /* will send audio messages as voice notes, if set to true */
         ptt: true,
         // will detect links & generate a link preview automatically (default true)
-        detectLinks: true
+        detectLinks: true,
+        /** Should it send as a disappearing messages. 
+         * By default 'chat' -- which follows the setting of the chat */
+        sendEphemeral: 'chat'
     }
     ```
 ## Forwarding Messages
@@ -305,6 +340,7 @@ export enum Presence {
     available = 'available', // "online"
     composing = 'composing', // "typing..."
     recording = 'recording', // "recording..."
+    paused = 'paused' // stopped typing, back to "online"
 }
 ```
 
@@ -353,10 +389,26 @@ setTimeout (() => {
     conn.modifyChat (jid, ChatModification.unmute)
 }, 5000) // unmute after 5 seconds
 
-await conn.deleteChat (jid) // will delete the chat (can be a group or broadcast list as well)
+await conn.modifyChat (jid, ChatModification.delete) // will delete the chat (can be a group or broadcast list as well)
 ```
 
 **Note:** to unmute or unpin a chat, one must pass the timestamp of the pinning or muting. This is returned by the pin & mute functions. This is also available in the `WAChat` objects of the respective chats, as a `mute` or `pin` property.
+
+## Disappearing Messages
+
+``` ts
+const jid = '1234@s.whatsapp.net' // can also be a group
+// turn on disappearing messages
+await conn.toggleDisappearingMessages(
+    jid, 
+    WA_DEFAULT_EPHEMERAL // this is 1 week in seconds -- how long you want messages to appear for
+) 
+// will automatically send as a disappearing message
+await conn.sendMessage(jid, 'Hello poof!', MessageType.text)
+// turn off disappearing messages
+await conn.toggleDisappearingMessages(jid, 0)
+
+```
 
 ## Misc
 
@@ -383,7 +435,7 @@ await conn.deleteChat (jid) // will delete the chat (can be a group or broadcast
     You can also load the entire conversation history if you want
     ``` ts
     await conn.loadAllMessages ("xyz@c.us", message => console.log("Loaded message with ID: " + message.key.id))
-    console.log("queried all messages") // promise resolves once all messages are retreived
+    console.log("queried all messages") // promise resolves once all messages are retrieved
     ```
 - To get the status of some person
     ``` ts
@@ -413,6 +465,11 @@ await conn.deleteChat (jid) // will delete the chat (can be a group or broadcast
     console.log (`got ${response.messages.length} messages in search`)
 
     const response2 = await conn.searchMessages ('so cool', '1234@c.us', 25, 1) // search in given chat
+    ```
+- To block or unblock user
+    ``` ts
+    await conn.blockUser ("xyz@c.us", "add") // Block user
+    await conn.blockUser ("xyz@c.us", "remove") // Unblock user
     ```
 Of course, replace ``` xyz ``` with an actual ID. 
 

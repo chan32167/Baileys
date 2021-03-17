@@ -1,5 +1,5 @@
 import {WAConnection as Base} from './4.Events'
-import { Presence, WABroadcastListInfo, WAProfilePictureChange, WALoadChatOptions } from './Constants'
+import { Presence, WABroadcastListInfo, WAProfilePictureChange, WALoadChatOptions, WAChatIndex, BlocklistUpdate } from './Constants'
 import {
     WAMessage,
     WANode,
@@ -33,10 +33,10 @@ export class WAConnection extends Base {
     isOnWhatsAppNoConn = async (str: string) => {
         let phone = str.split('@')[0]
         const url = `https://wa.me/${phone}`
-        const response = await this.fetchRequest(url, 'GET', undefined, undefined, undefined, 'manual')
-        const loc = response.headers.get('Location')
+        const response = await this.fetchRequest(url, 'GET', undefined, undefined, undefined, false)
+        const loc = response.headers.location as string
         if (!loc) {
-            this.logger.warn({ url, status: response.status }, 'did not get location from request')
+            this.logger.warn({ url, status: response.statusCode }, 'did not get location from request')
             return
         }
         const locUrl = new URL('', loc)
@@ -51,18 +51,15 @@ export class WAConnection extends Base {
      * @param jid the ID of the person/group who you are updating
      * @param type your presence
      */
-    updatePresence = (jid: string | null, type: Presence) =>
-        this.query(
-            {
-                json: [
-                    'action',
-                    { epoch: this.msgCount.toString(), type: 'set' },
-                    [['presence', { type: type, to: jid }, null]],
-                ], 
-                binaryTags: [WAMetric.group, WAFlag.acknowledge], 
-                expect200: true
-            }
-        ) as Promise<{status: number}>
+    updatePresence = (jid: string | null, type: Presence) => this.sendBinary(
+        [   'action', 
+            {epoch: this.msgCount.toString(), type: 'set'},
+            [ ['presence', { type: type, to: jid }, null] ]
+        ],
+        [WAMetric.presence, WAFlag[type] ], // weird stuff WA does
+        undefined,
+        true
+    )
     /** Request an update on the presence of a user */
     requestPresenceUpdate = async (jid: string) => this.query({ json: ['action', 'presence', 'subscribe', jid] })
     /** Query the status of the person (see groupMetadata() for groups) */
@@ -79,20 +76,38 @@ export class WAConnection extends Base {
                     Buffer.from (status, 'utf-8')
                 ]
             ]
-        ) 
-        this.emit ('user-status-update', { jid: this.user.jid, status })
+        )
+        this.emit ('contact-update', { jid: this.user.jid, status })
+        return response
+    }
+    async updateProfileName (name: string) {
+        const response = (await this.setQuery (
+            [
+                [
+                    'profile',
+                    {
+                        name
+                    },
+                    null
+                ]
+            ]
+        )) as any as {status: number, pushname: string}
+        if (response.status === 200) {
+            this.user.name = response.pushname;
+            this.emit ('contact-update', { jid: this.user.jid, name })
+        }
         return response
     }
     /** Get your contacts */
     async getContacts() {
         const json = ['query', { epoch: this.msgCount.toString(), type: 'contacts' }, null]
-        const response = await this.query({ json, binaryTags: [6, WAFlag.ignore], expect200: true }) // this has to be an encrypted query
+        const response = await this.query({ json, binaryTags: [WAMetric.queryContact, WAFlag.ignore], expect200: true, requiresPhoneConnection: true }) // this has to be an encrypted query
         return response
     }
     /** Get the stories of your contacts */
     async getStories() {
         const json = ['query', { epoch: this.msgCount.toString(), type: 'status' }, null]
-        const response = await this.query({json, binaryTags: [30, WAFlag.ignore], expect200: true }) as WANode
+        const response = await this.query({json, binaryTags: [WAMetric.queryStatus, WAFlag.ignore], expect200: true, requiresPhoneConnection: true }) as WANode
         if (Array.isArray(response[2])) {
             return response[2].map (row => (
                 { 
@@ -110,16 +125,12 @@ export class WAConnection extends Base {
         return this.query({ json, binaryTags: [5, WAFlag.ignore], expect200: true }) // this has to be an encrypted query
     }
     /** Query broadcast list info */
-    async getBroadcastListInfo(jid: string) { return this.query({json: ['query', 'contact', jid], expect200: true }) as Promise<WABroadcastListInfo> }
-    /** Delete the chat of a given ID */
-    async deleteChat (jid: string) {
-        const response = await this.setQuery ([ ['chat', {type: 'delete', jid: jid}, null] ], [12, WAFlag.ignore])
-        const chat = this.chats.get (jid)
-        if (chat) {
-            this.chats.delete (chat)
-            this.emit ('chat-update', { jid, delete: 'true' })
-        }
-        return response
+    async getBroadcastListInfo(jid: string) { 
+        return this.query({
+            json: ['query', 'contact', jid], 
+            expect200: true, 
+            requiresPhoneConnection: true
+        }) as Promise<WABroadcastListInfo> 
     }
     /**
      * Load chats in a paginated manner + gets the profile picture
@@ -128,21 +139,12 @@ export class WAConnection extends Base {
      * @param searchString optionally search for users
      * @returns the chats & the cursor to fetch the next page
      */
-    async loadChats (count: number, before: string | null, options: WALoadChatOptions = {}) {
+    loadChats (count: number, before: string | null, options: WALoadChatOptions = {}) {
         const searchString = options.searchString?.toLowerCase()
         const chats = this.chats.paginated (before, count, options && (chat => (
             (typeof options?.custom !== 'function' || options?.custom(chat)) &&
             (typeof searchString === 'undefined' || chat.name?.toLowerCase().includes (searchString) || chat.jid?.includes(searchString))
         )))
-        let loadPP = this.loadProfilePicturesForChatsAutomatically
-        if (typeof options.loadProfilePicture !== 'undefined') loadPP = options.loadProfilePicture
-        if (loadPP) {
-            await Promise.all (
-                chats.map (async chat => (
-                    typeof chat.imgUrl === 'undefined' && await this.setProfilePicture (chat)
-                ))
-            )
-        }
         const cursor = (chats[chats.length-1] && chats.length >= count) && this.chatOrderingKey.key (chats[chats.length-1])
         return { chats, cursor }
     }
@@ -171,5 +173,42 @@ export class WAConnection extends Base {
             this.emit ('chat-update', { jid, imgUrl: response.eurl })
         }
         return response
+    }
+    /**
+     * Add or remove user from blocklist
+     * @param jid the ID of the person who you are blocking/unblocking
+     * @param type type of operation
+     */
+    @Mutex (jid => jid)
+    async blockUser (jid: string, type: 'add' | 'remove' = 'add') {
+        const json: WANode = [
+            'block',
+            {
+                type: type,
+            },
+            [
+                ['user', { jid }, null]
+            ],
+        ]
+        const result = await this.setQuery ([json], [WAMetric.block, WAFlag.ignore])
+
+        if (result.status === 200) {
+            if (type === 'add') {
+                this.blocklist.push(jid)
+            } else {
+                const index = this.blocklist.indexOf(jid);
+                if (index !== -1) {
+                    this.blocklist.splice(index, 1);
+                }
+            }
+
+            // Blocklist update event
+            const update: BlocklistUpdate = { added: [], removed: [] }
+            let key = type === 'add' ? 'added' : 'removed'
+            update[key] = [ jid ]
+            this.emit('blocklist-update', update)
+        }
+
+        return result
     }
 }

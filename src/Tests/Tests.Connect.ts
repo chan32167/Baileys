@@ -1,26 +1,23 @@
 import * as assert from 'assert'
-import {WAConnection} from '../WAConnection/WAConnection'
-import { AuthenticationCredentialsBase64, BaileysError, ReconnectMode, DisconnectReason, WAChat } from '../WAConnection/Constants'
+import {WAConnection} from '../WAConnection'
+import { AuthenticationCredentialsBase64, BaileysError, ReconnectMode, DisconnectReason, WAChat, WAContact } from '../WAConnection/Constants'
 import { delay } from '../WAConnection/Utils'
 import { assertChatDBIntegrity, makeConnection, testJid } from './Common'
 
 describe('QR Generation', () => {
     it('should generate QR', async () => {
         const conn = makeConnection ()
-        conn.connectOptions.regenerateQRIntervalMs = 5000
+        conn.connectOptions.maxRetries = 0
 
         let calledQR = 0
         conn.removeAllListeners ('qr')
-        conn.on ('qr', qr => calledQR += 1)
+        conn.on ('qr', () => calledQR += 1)
         
         await conn.connect()
             .then (() => assert.fail('should not have succeeded'))
-            .catch (error => {
-                assert.equal (error.message, 'timed out')
-            })
-        assert.deepEqual (conn['pendingRequests'], [])
-        assert.deepEqual (
-            Object.keys(conn['callbacks']).filter(key => !key.startsWith('function:')), 
+            .catch (error => {})
+        assert.deepStrictEqual (
+            Object.keys(conn.eventNames()).filter(key => key.startsWith('TAG:')), 
             []
         )
         assert.ok(calledQR >= 2, 'QR not called')
@@ -75,14 +72,14 @@ describe('Test Connect', () => {
         const conn = makeConnection ()
         conn.logger.level = 'debug'
         await conn.loadAuthInfo('./auth_info.json').connect ()
-        assert.equal (conn.phoneConnected, true)
+        assert.strictEqual (conn.phoneConnected, true)
 
         try {
             const waitForEvent = expect => new Promise (resolve => {
                 conn.on ('connection-phone-change', ({connected}) => {
                     if (connected === expect) {
                         conn.removeAllListeners ('connection-phone-change')
-                        resolve ()
+                        resolve(undefined)
                     }
                 })
             })
@@ -220,7 +217,7 @@ describe ('Reconnects', () => {
         conn.autoReconnect = ReconnectMode.onConnectionLost
 
         await conn.loadAuthInfo('./auth_info.json').connect ()
-        assert.equal (conn.phoneConnected, true)
+        assert.strictEqual (conn.phoneConnected, true)
 
         try {
             const closeConn = () => conn['conn']?.terminate ()
@@ -237,7 +234,7 @@ describe ('Reconnects', () => {
                     if (closes >= 1) {
                         conn.removeAllListeners ('close')
                         conn.removeAllListeners ('connecting')
-                        resolve ()
+                        resolve(undefined)
                     }
                 })
                 conn.on ('connecting', () => {
@@ -252,7 +249,7 @@ describe ('Reconnects', () => {
             await new Promise (resolve => {
                 conn.on ('open', () => {
                     conn.removeAllListeners ('open')
-                    resolve ()
+                    resolve(undefined)
                 })
             })
 
@@ -272,7 +269,7 @@ describe ('Reconnects', () => {
         conn.autoReconnect = ReconnectMode.onConnectionLost
 
         await conn.loadAuthInfo('./auth_info.json').connect ()
-        assert.equal (conn.phoneConnected, true)
+        assert.strictEqual (conn.phoneConnected, true)
 
         await delay (30*1000)
 
@@ -288,7 +285,7 @@ describe ('Reconnects', () => {
 })
 
 describe ('Pending Requests', () => {
-    it ('should correctly send updates', async () => {
+    it ('should correctly send updates for chats', async () => {
         const conn = makeConnection ()
         conn.pendingRequestTimeoutMs = null
         conn.loadAuthInfo('./auth_info.json')
@@ -318,6 +315,42 @@ describe ('Pending Requests', () => {
 
         conn.close ()
     })
+    it ('should correctly send updates for contacts', async () => {
+        const conn = makeConnection ()
+        conn.pendingRequestTimeoutMs = null
+        conn.loadAuthInfo('./auth_info.json')
+
+        const task: any = new Promise(resolve => conn.once('contacts-received', resolve))
+        await conn.connect ()
+        const initialResult = await task
+        assert.strictEqual(
+            initialResult.updatedContacts.length,
+            Object.keys(conn.contacts).length
+        )
+
+
+        conn.close ()
+
+        const [jid] = Object.keys(conn.contacts)
+        const oldContact = conn.contacts[jid]
+        oldContact.name = 'Lol'
+        oldContact.index = 'L'
+
+        const promise = new Promise(resolve => conn.once('contacts-received', resolve))
+
+        const result = await conn.connect ()
+        assert.ok (!result.newConnection)
+
+        const {updatedContacts} = await promise as { updatedContacts: Partial<WAContact>[] }
+        const contact = updatedContacts.find (c => c.jid === jid)
+        assert.ok (contact)
+        
+        assert.ok ('name' in contact)
+        assert.strictEqual (Object.keys(contact).length, 3)
+        assert.strictEqual (Object.keys(updatedContacts).length, 1)
+
+        conn.close ()
+    })
     it('should queue requests when closed', async () => {
           const conn = makeConnection ()
           //conn.pendingRequestTimeoutMs = null
@@ -339,4 +372,36 @@ describe ('Pending Requests', () => {
 
           conn.close ()
     })
+    it('[MANUAL] should receive query response after phone disconnect', async () => {
+        const conn = makeConnection ()
+        await conn.loadAuthInfo('./auth_info.json').connect ()
+
+        console.log(`disconnect your phone from the internet!`)
+        await delay(5000)
+        const task = conn.loadMessages(testJid, 50)
+        setTimeout(() => console.log('reconnect your phone!'), 20_000)
+
+        const result = await task
+        assert.ok(result.messages[0])
+        assert.ok(!conn['phoneCheckInterval']) // should be undefined
+
+        conn.close ()
+    })
+    it('should re-execute query on connection closed error', async () => {
+        const conn = makeConnection ()
+        //conn.pendingRequestTimeoutMs = 10_000
+        await conn.loadAuthInfo('./auth_info.json').connect ()
+        const task: Promise<any> = conn.query({json: ['query', 'Status', conn.user.jid], waitForOpen: true})
+        
+        await delay(20)
+        conn['onMessageRecieved']('1234,["Pong",false]') // fake cancel the connection
+
+        await delay(2000)
+
+        const json = await task
+        
+        assert.ok (json.status)
+
+        conn.close ()
+  })
 })
